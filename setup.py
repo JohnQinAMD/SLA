@@ -23,7 +23,7 @@ setup(
     author_email='jtzhang6@gmail.com',
     url='https://github.com/thu-ml/SLA',
     packages=find_packages(),
-    python_requires='>=3.12',
+    python_requires='>=3.10',
     install_requires=[
         'torch>=2.7.0',
         'triton>=3.3.0',

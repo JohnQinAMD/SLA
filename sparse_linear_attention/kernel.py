@@ -17,7 +17,23 @@ import torch
 import triton
 import triton.language as tl
 
+def get_autotune_configs():
+    configs = []
+    for num_warps in [2, 4]:
+        for num_stages in [0, 1, 2, 3]:
+            for waves_per_eu in [1, 2, 3]:
+                for matrix_instr_nonkdim in [16, 32]:
+                    for kpack in [1, 2]:
+                        configs.append(triton.Config(
+                            {"waves_per_eu" : waves_per_eu, "matrix_instr_nonkdim" : matrix_instr_nonkdim, "kpack" : kpack},
+                            num_warps=num_warps, num_stages=num_stages))
+    return configs
+CONFIGS = get_autotune_configs()
 
+# def bench_function(fn, quantiles):
+#     return triton.testing.do_bench(fn, warmup=10, rep=16)
+
+@triton.autotune(configs=CONFIGS, key=["L", "D", "BLOCK_M", "BLOCK_N", "B", "H"], warmup=8, rep=32)
 @triton.jit
 def _attn_fwd(
     Q, K, V,
@@ -29,6 +45,7 @@ def _attn_fwd(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    B : tl.constexpr, H : tl.constexpr,
 ):
     idx_m = tl.program_id(0).to(tl.int64)
     idx_bh = tl.program_id(1).to(tl.int64)
@@ -81,7 +98,6 @@ def _attn_fwd(
     m_i += tl.math.log2(l_i)
     tl.store(LSE_ptrs, m_i, mask=offs_m < L)
 
-
 @triton.jit
 def _attn_bwd_preprocess(
     OS, DOS, DELTAS,
@@ -105,8 +121,8 @@ def _attn_bwd_preprocess(
     delta_s = tl.sum(o_s * do_s, axis=1).to(DELTAS.type.element_ty)
     tl.store(DELTAS + offs_m, delta_s, mask=offs_m < L)
 
-
 # the main inner-loop logic for computing dQ
+@triton.autotune(configs=CONFIGS, key=["L", "D", "BLOCK_M", "BLOCK_N", "B", "H"], warmup=8, rep=32)
 @triton.jit
 def _attn_bwd_dq(
     Q, K, V, LSE, DELTAS,
@@ -118,6 +134,7 @@ def _attn_bwd_dq(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    B : tl.constexpr, H : tl.constexpr,
 ):
     idx_m = tl.program_id(0).to(tl.int64)
     idx_bh = tl.program_id(1).to(tl.int64)
@@ -146,7 +163,7 @@ def _attn_bwd_dq(
     lse = tl.load(LSE_ptrs, mask=offs_m < L, other=float("inf"))
     
     dq = tl.zeros([BLOCK_M, D], dtype=tl.float32)
-    for block_idx in tl.range(topk, num_stages=2):
+    for block_idx in tl.range(topk):
         idx_n = tl.load(LUT_ptr + block_idx)
         n_mask = offs_n < L - idx_n * BLOCK_N
         
@@ -163,7 +180,7 @@ def _attn_bwd_dq(
         dq += tl.dot(ds.to(k.dtype), k)
     tl.store(DQ_ptrs, dq * qk_scale, mask=offs_m[:, None] < L)
     
-
+@triton.autotune(configs=CONFIGS, key=["L", "D", "BLOCK_M", "BLOCK_N", "B", "H"], warmup=8, rep=32)
 @triton.jit
 def _attn_bwd_dkdv(
     Q, K, V, DOS, DK, DV,
@@ -175,6 +192,7 @@ def _attn_bwd_dkdv(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_SLICE_FACTOR: tl.constexpr,
+    B : tl.constexpr, H : tl.constexpr,
 ):
     BLOCK_M2: tl.constexpr = BLOCK_M // BLOCK_SLICE_FACTOR
 
@@ -262,8 +280,9 @@ class _attention(torch.autograd.Function):
             lut, lse, o_s,
             L, M_BLOCKS,
             D, BLOCK_M, BLOCK_N,
-            num_warps=4 if q.shape[-1] == 64 else 8,
-            num_stages=3
+            # num_warps=4 if q.shape[-1] == 64 else 8,
+            # num_stages=2
+            B=B, H=H, 
         )
         
         ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
@@ -302,8 +321,9 @@ class _attention(torch.autograd.Function):
             ctx.qk_scale, ctx.topk,
             L, M_BLOCKS,
             D, BLOCK_M, BLOCK_N,
-            num_warps=4 if q.shape[-1] == 64 else 8,
-            num_stages=4 if q.shape[-1] == 64 else 5
+            # num_warps=4 if q.shape[-1] == 64 else 8,
+            # num_stages=4 if q.shape[-1] == 64 else 5
+            B=B, H=H, 
         )
 
         grid = (N_BLOCKS, B * H)
@@ -313,8 +333,9 @@ class _attention(torch.autograd.Function):
             L, M_BLOCKS, N_BLOCKS,
             D, BLOCK_M, BLOCK_N,
             BLOCK_SLICE_FACTOR=BLOCK_M // 64,
-            num_warps=4 if q.shape[-1] == 64 else 8,
-            num_stages=4 if q.shape[-1] == 64 else 5
+            # num_warps=4 if q.shape[-1] == 64 else 8,
+            # num_stages=4 if q.shape[-1] == 64 else 5
+            B=B, H=H, 
         )
 
         return dq, dk, dv, None, None, None, None, None, None
