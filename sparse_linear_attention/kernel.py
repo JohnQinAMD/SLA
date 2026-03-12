@@ -17,23 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
-def get_autotune_configs():
-    configs = []
-    for num_warps in [2, 4]:
-        for num_stages in [0, 1, 2, 3]:
-            for waves_per_eu in [1, 2, 3]:
-                for matrix_instr_nonkdim in [16, 32]:
-                    for kpack in [1, 2]:
-                        configs.append(triton.Config(
-                            {"waves_per_eu" : waves_per_eu, "matrix_instr_nonkdim" : matrix_instr_nonkdim, "kpack" : kpack},
-                            num_warps=num_warps, num_stages=num_stages))
-    return configs
-CONFIGS = get_autotune_configs()
+from .tuner import Phase, get_triton_autotune_decorator
 
-# def bench_function(fn, quantiles):
-#     return triton.testing.do_bench(fn, warmup=10, rep=16)
-
-@triton.autotune(configs=CONFIGS, key=["L", "D", "BLOCK_M", "BLOCK_N", "B", "H"], warmup=8, rep=32)
 @triton.jit
 def _attn_fwd(
     Q, K, V,
@@ -45,7 +30,6 @@ def _attn_fwd(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    B : tl.constexpr, H : tl.constexpr,
 ):
     idx_m = tl.program_id(0).to(tl.int64)
     idx_bh = tl.program_id(1).to(tl.int64)
@@ -122,7 +106,6 @@ def _attn_bwd_preprocess(
     tl.store(DELTAS + offs_m, delta_s, mask=offs_m < L)
 
 # the main inner-loop logic for computing dQ
-@triton.autotune(configs=CONFIGS, key=["L", "D", "BLOCK_M", "BLOCK_N", "B", "H"], warmup=8, rep=32)
 @triton.jit
 def _attn_bwd_dq(
     Q, K, V, LSE, DELTAS,
@@ -134,7 +117,6 @@ def _attn_bwd_dq(
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    B : tl.constexpr, H : tl.constexpr,
 ):
     idx_m = tl.program_id(0).to(tl.int64)
     idx_bh = tl.program_id(1).to(tl.int64)
@@ -180,7 +162,6 @@ def _attn_bwd_dq(
         dq += tl.dot(ds.to(k.dtype), k)
     tl.store(DQ_ptrs, dq * qk_scale, mask=offs_m[:, None] < L)
     
-@triton.autotune(configs=CONFIGS, key=["L", "D", "BLOCK_M", "BLOCK_N", "B", "H"], warmup=8, rep=32)
 @triton.jit
 def _attn_bwd_dkdv(
     Q, K, V, DOS, DK, DV,
@@ -192,7 +173,6 @@ def _attn_bwd_dkdv(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_SLICE_FACTOR: tl.constexpr,
-    B : tl.constexpr, H : tl.constexpr,
 ):
     BLOCK_M2: tl.constexpr = BLOCK_M // BLOCK_SLICE_FACTOR
 
@@ -275,14 +255,13 @@ class _attention(torch.autograd.Function):
         lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
 
         grid = (M_BLOCKS, B * H)
-        _attn_fwd[grid](
+
+        fwd_kernel = get_triton_autotune_decorator(_attn_fwd, L, D, Phase.FORWARD)
+        fwd_kernel[grid](
             q, k, v, qk_scale, topk,
             lut, lse, o_s,
             L, M_BLOCKS,
             D, BLOCK_M, BLOCK_N,
-            # num_warps=4 if q.shape[-1] == 64 else 8,
-            # num_stages=2
-            B=B, H=H, 
         )
         
         ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
@@ -315,27 +294,23 @@ class _attention(torch.autograd.Function):
         )
 
         grid = (M_BLOCKS, B * H)
-        _attn_bwd_dq[grid](
+        bwd_dq_kernel = get_triton_autotune_decorator(_attn_bwd_dq, L, D, Phase.BACKWARD_DQ)
+        bwd_dq_kernel[grid](
             q, k, v, lse, delta_s,
             do_s, dq, lut,
             ctx.qk_scale, ctx.topk,
             L, M_BLOCKS,
             D, BLOCK_M, BLOCK_N,
-            # num_warps=4 if q.shape[-1] == 64 else 8,
-            # num_stages=4 if q.shape[-1] == 64 else 5
-            B=B, H=H, 
         )
 
         grid = (N_BLOCKS, B * H)
-        _attn_bwd_dkdv[grid](
+        bwd_dkdv_kernel = get_triton_autotune_decorator(_attn_bwd_dkdv, L, D, Phase.BACKWARD_DKDV)
+        bwd_dkdv_kernel[grid](
             q, k, v, do_s, dk, dv,
             ctx.qk_scale, k_block_id, lse, delta_s,
             L, M_BLOCKS, N_BLOCKS,
             D, BLOCK_M, BLOCK_N,
             BLOCK_SLICE_FACTOR=BLOCK_M // 64,
-            # num_warps=4 if q.shape[-1] == 64 else 8,
-            # num_stages=4 if q.shape[-1] == 64 else 5
-            B=B, H=H, 
         )
 
         return dq, dk, dv, None, None, None, None, None, None
