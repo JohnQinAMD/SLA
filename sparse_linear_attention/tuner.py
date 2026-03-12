@@ -4,8 +4,10 @@ from enum import Enum
 from typing import Callable
 
 import triton
+import torch
 
 SLA_ENABLE_TRITON_AUTOTUNING = os.getenv("SLA_ENABLE_TRITON_AUTOTUNING", "0") == "1"
+GPU_ARCH = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
 
 _tuned_kernel_caches = {}
 
@@ -16,6 +18,8 @@ class Phase(Enum):
 
 def get_heuristic_triton_config(L : int, D : int, phase : Phase):
     assert isinstance(phase, Phase)
+    # TODO (limou)
+    # optimize heuristic choosing
     match phase:
         case Phase.FORWARD:
             if D <= 64:
@@ -89,7 +93,7 @@ def get_triton_autotune_decorator(func : Callable, L : int, D : int, phase: Phas
             for num_stages in ([0, 1] if phase == Phase.FORWARD else [0, 1, 2, 3]):
                 for waves_per_eu in [2]:
                     for matrix_instr_nonkdim in ([32] if phase == Phase.FORWARD else [16, 32]):
-                        for kpack in [2]:
+                        for kpack in ([1] if GPU_ARCH == "gfx950" else [1, 2]):
                             configs.append(triton.Config(
                                 {"waves_per_eu" : waves_per_eu, "matrix_instr_nonkdim" : matrix_instr_nonkdim, "kpack" : kpack},
                                 num_warps=num_warps, num_stages=num_stages))
@@ -102,6 +106,6 @@ def get_triton_autotune_decorator(func : Callable, L : int, D : int, phase: Phas
         warmup = 3,
         rep = 10,
         )(func)
-    print("create new tuned kernel for ", func.__name__)
+
     _tuned_kernel_caches[tuned_key] = tuned_kernel
     return tuned_kernel
