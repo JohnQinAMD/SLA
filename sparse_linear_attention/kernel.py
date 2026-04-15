@@ -270,13 +270,14 @@ except Exception as _e:  # noqa: F841
 _CK_SLA_AVAILABLE = _CK_SLA_FWD_AVAILABLE
 
 
-def _sla_use_ck(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool:
-    """Gate the CK fwd path: gfx950 / bf16 / hdim=128 / (128, 64) tile only.
+def _sla_use_ck_fwd(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool:
+    """Gate the CK fwd path.
 
-    Stage 7 Tier 2 flipped the policy — CK fwd is now also legal under
-    grad-enabled contexts, because there's a matching CK bwd. The old
-    `not torch.is_grad_enabled()` guard is gone; backward dispatch is
-    handled by `_sla_use_ck_bwd()` at save-for-backward time.
+    The CK VSA fwd pipeline is only instantiated at (kM0=128, kN0=64)
+    today, so Config C is the only SLA tile shape it accepts. Extending
+    to BLKQ=64 (Config A/B) requires adding a (kM0=64, kN0=64) tile
+    instance to the fwd codegen — see REPRODUCE.md "Supported
+    configurations" for the engineering notes.
     """
     import os
     if os.environ.get("SLA_DISABLE_CK", "0") == "1":
@@ -291,26 +292,45 @@ def _sla_use_ck(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool:
     )
 
 
+# Backward-compatibility alias for older call sites that still reference
+# `_sla_use_ck` as the fwd gate.
+_sla_use_ck = _sla_use_ck_fwd
+
+
 def _sla_use_ck_bwd(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool:
     """Gate the CK bwd path.
 
-    Tier 2.5 Step 1 + Phase 1 landed the split dkdv+dq CK bwd. Measured
-    on chi2812 / primus:v26.2 (Config C, B=1 H=24 S=65536 D=128, topk=0.10):
-      - CK split bwd:       40.46 ms wall  (18.68 dkdv + 18.18 dq kernel)
-      - Triton autotune:    46.714 ms (published reference, MI355X)
-      - speedup vs ref:     1.155× (13.4% faster than reference)
-      - SNR vs Triton bwd:  54-76 dB on a 6-config sweep
-    Default is ON. Users can explicitly disable via SLA_USE_CK_BWD=0.
+    Tier 2.5 Step 1 + Phase 1/2 + N2/N3 landed the split dkdv+dq CK bwd
+    for SLA at (kM0=64, kN0=64). BLKQ=64 (Config A/B) uses q_scale=1
+    and BLKQ=128 (Config C) uses q_scale=2 — both are supported by the
+    same pipeline instantiation and the same K-major LUT transpose.
 
-    Correctness is gated on the fwd having taken the CK path because the
-    bwd pipelines consume log2-space LSE straight from the CK fwd output
-    (the wasted natural-log round-trip was removed in Phase 1 P1.4)."""
+    Config C measurement (chi2812 / primus:v26.2 / MI355X):
+      - CK split bwd:       33.84 ms wall  (18.06 dkdv + 12.35 dq kernel)
+      - Triton autotune:    46.714 ms (published MI355X reference)
+      - speedup vs ref:     1.380× (27.6% faster than reference)
+      - SNR vs Triton bwd:  54-76 dB on a 6-config sweep
+
+    The CK bwd is independent of the fwd path — it consumes log2-space
+    LSE which both the CK fwd and the Triton fwd produce (Triton fwd at
+    kernel.py:82 stores `m_i + log2(l_i)`, matching the CK fwd
+    convention). So CK bwd dispatches even when the fwd took the
+    Triton path (relevant for Config A/B where CK fwd is unavailable).
+
+    Default is ON. Users can explicitly disable via SLA_USE_CK_BWD=0.
+    """
     import os
     if os.environ.get("SLA_USE_CK_BWD", "1") != "1":
         return False
+    if os.environ.get("SLA_DISABLE_CK", "0") == "1":
+        return False
     return (
         _CK_SLA_BWD_AVAILABLE
-        and _sla_use_ck(q, D, BLOCK_M, BLOCK_N)
+        and q.dtype == torch.bfloat16
+        and D == 128
+        and BLOCK_M in (64, 128)
+        and BLOCK_N == 64
+        and q.is_contiguous()
     )
 
 
@@ -332,24 +352,29 @@ class _attention(torch.autograd.Function):
 
         M_BLOCKS = triton.cdiv(L, BLOCK_M)
 
-        # CK-tile VSA fast path (Stage 2 fwd + Stage 7 Tier 2 bwd).
-        # Requires bf16, D=128, BLOCK_M=128, BLOCK_N=64, contiguous. Under
-        # grad-enabled contexts we also require the bwd kernel to be built
-        # (aiter.ops.sla.sla_bwd), otherwise fall through to Triton so
-        # autograd still sees a working backward.
+        # CK dispatch — the fwd and bwd gates are independent.
+        # `ck_fwd_ok` needs BLOCK_M=128 (fwd has no kM0=64 tile yet).
+        # `ck_bwd_ok` accepts BLOCK_M in {64, 128} since the bwd pipeline
+        # runs at kM0=64 natively and handles BLKQ=128 via q_scale=2.
+        # This lets Config A/B (BLKQ=64) take CK bwd even though the fwd
+        # still runs on Triton. Both fwds store log2-space LSE
+        # (Triton at line 82, CK per pipeline comment), so the CK bwd
+        # can consume either.
         needs_grad = any(t.requires_grad for t in (q, k, v))
-        ck_fwd_ok = _sla_use_ck(q, D, BLOCK_M, BLOCK_N)
-        ck_bwd_ok = ck_fwd_ok and _sla_use_ck_bwd(q, D, BLOCK_M, BLOCK_N)
+        ck_fwd_ok = _sla_use_ck_fwd(q, D, BLOCK_M, BLOCK_N)
+        ck_bwd_ok = _sla_use_ck_bwd(q, D, BLOCK_M, BLOCK_N)
+
+        # Path A: CK fwd (+ CK bwd if under grad).
+        # CK fwd is only taken when either no grad is needed OR the CK bwd
+        # matches the same (BLOCK_M, BLOCK_N) — we can't emit a CK fwd
+        # under grad that later falls back to Triton bwd because we'd
+        # need to save k_block_id and would lose CK fwd's LSE tensor.
         if ck_fwd_ok and (not needs_grad or ck_bwd_ok):
             lut_bhq = lut.view(B, H, M_BLOCKS, topk).to(torch.int32).contiguous()
             o_s, lse_ck = _aiter_sla_fwd(
                 q, k, v, lut_bhq, BLOCK_M, BLOCK_N, float(qk_scale)
             )
             if needs_grad:
-                # Stash lse_ck and the [B,H,M,topk] int32 LUT so backward
-                # can call sla_bwd directly without re-shaping. k_block_id
-                # is unused by the CK bwd (it builds its own transposed
-                # LUT), so we don't save it.
                 ctx.save_for_backward(q, k, v, lut_bhq, lse_ck, o_s)
                 ctx.ck_bwd_path = True
             ctx.qk_scale = qk_scale
@@ -358,6 +383,7 @@ class _attention(torch.autograd.Function):
             ctx.BLOCK_N = BLOCK_N
             return o_s
 
+        # Path B: Triton fwd (CK fwd not available, or CK bwd disabled).
         o_s = torch.empty_like(v)
         lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
 
@@ -373,9 +399,18 @@ class _attention(torch.autograd.Function):
 
         # save_for_backward costs ~10ms per call on MI355X via the autograd
         # dispatch; skip when grad isn't needed (e.g. inference benches).
-        if any(t.requires_grad for t in (q, k, v)):
-            ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
-            ctx.ck_bwd_path = False
+        if needs_grad:
+            if ck_bwd_ok:
+                # Triton fwd + CK bwd cross-path dispatch (enables Config
+                # A/B CK bwd even though the fwd stayed on Triton).
+                # Triton fwd stores log2-space LSE at kernel.py:82, which
+                # matches what the CK bwd pipelines consume directly.
+                lut_bhq = lut.view(B, H, M_BLOCKS, topk).to(torch.int32).contiguous()
+                ctx.save_for_backward(q, k, v, lut_bhq, lse, o_s)
+                ctx.ck_bwd_path = True
+            else:
+                ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
+                ctx.ck_bwd_path = False
         ctx.qk_scale = qk_scale
         ctx.topk = topk
         ctx.BLOCK_M = BLOCK_M
@@ -386,12 +421,16 @@ class _attention(torch.autograd.Function):
     def backward(ctx, do_s):
         BLOCK_M, BLOCK_N = ctx.BLOCK_M, ctx.BLOCK_N
 
-        # Stage 7 Tier 2 CK bwd dispatch. When forward took the CK path under
-        # grad, ctx has (q, k, v, lut_bhq, lse_ck, o_s) with lse in log2 space
-        # (matching Triton's convention; sla_bwd converts to natural log
-        # internally). Call aiter's sla_bwd directly; it builds the transposed
-        # LUT in the wrapper. Returns only dq, dk, dv — other grad slots stay
-        # None because we took a k_block_id=None branch in forward.
+        # CK bwd dispatch. ctx.ck_bwd_path is set by forward in two cases:
+        #   (a) Full CK path (Config C): ck_fwd_ok + ck_bwd_ok, both took CK.
+        #   (b) Cross-path (Config A/B): Triton fwd + CK bwd — fwd stays on
+        #       Triton because CK fwd doesn't have a BLOCK_M=64 tile, but
+        #       the CK bwd consumes the Triton fwd's log2-space LSE directly.
+        # In both cases ctx.saved_tensors is the 6-tuple
+        # (q, k, v, lut_bhq, lse, o_s) with lse in log2 space. sla_bwd's
+        # wrapper builds the transposed K-major LUT internally. Returns only
+        # dq, dk, dv — other grad slots stay None because we took a
+        # k_block_id=None branch in forward.
         if getattr(ctx, "ck_bwd_path", False):
             q, k, v, lut_bhq, lse_ck, o_s = ctx.saved_tensors
             do_s = do_s.contiguous()
