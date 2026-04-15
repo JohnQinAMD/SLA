@@ -56,7 +56,7 @@ def _attn_fwd(
     for block_idx in tl.range(topk):
         idx_n = tl.load(LUT_ptr + block_idx)
         n_mask = offs_n < L - idx_n * BLOCK_N
-        
+
         k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[None, :])
         qk = tl.dot(q, k) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
         if L - idx_n * BLOCK_N < BLOCK_N:
@@ -145,21 +145,37 @@ def _attn_bwd_dq(
     lse = tl.load(LSE_ptrs, mask=offs_m < L, other=float("inf"))
     
     dq = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    # Manual K/V double-buffering: pre-load the first K/V tile outside
+    # the loop so inside the loop we can issue the next load before the
+    # current compute finishes, hiding ~200 cycles of load latency.
+    idx_n = tl.load(LUT_ptr + 0)
+    n_mask = offs_n < L - idx_n * BLOCK_N
+    k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
+    v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
+
     for block_idx in tl.range(topk):
-        idx_n = tl.load(LUT_ptr + block_idx)
-        n_mask = offs_n < L - idx_n * BLOCK_N
-        
-        k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
-        v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
-        qk = tl.dot(q, k.T) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
-        p = tl.math.exp2(qk - lse[:, None])
+        next_ok = block_idx + 1 < topk
+        next_idx = tl.where(next_ok, block_idx + 1, 0)
+        idx_n_next = tl.load(LUT_ptr + next_idx)
+        n_mask_next = offs_n < L - idx_n_next * BLOCK_N
+        k_next = tl.load(K_ptrs + idx_n_next * BLOCK_N * D, mask=n_mask_next[:, None])
+        v_next = tl.load(V_ptrs + idx_n_next * BLOCK_N * D, mask=n_mask_next[:, None])
+
+        # Fuse the fp32 intermediates into their single-use expressions
+        # so the compiler can release the [BLOCK_M, BLOCK_N] tiles between
+        # iterations. Materializing qk or dp as named values holds
+        # registers unnecessarily.
+        p = tl.math.exp2(tl.dot(q, k.T) * (qk_scale * 1.4426950408889634) - lse[:, None])
         p = tl.where(n_mask[None, :], p, 0.0)
-        
-        # Compute dP and dS.
-        dp = tl.dot(do_s, v.T).to(tl.float32)
-        ds = p * (dp - delta_s[:, None])
+        ds = p * (tl.dot(do_s, v.T).to(tl.float32) - delta_s[:, None])
         # Compute dQ.
         dq += tl.dot(ds.to(k.dtype), k)
+
+        idx_n = idx_n_next
+        n_mask = n_mask_next
+        k = k_next
+        v = v_next
     tl.store(DQ_ptrs, dq * qk_scale, mask=offs_m[:, None] < L)
     
 @triton.jit
@@ -200,7 +216,7 @@ def _attn_bwd_dkdv(
     # load K, V and CK: they stay in SRAM throughout the inner loop.
     k = tl.load(K_ptrs, mask=offs_n[:, None] < L)
     v = tl.load(V_ptrs, mask=offs_n[:, None] < L)
-        
+
     dk = tl.zeros([BLOCK_N, D], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, D], dtype=tl.float32)
     for idx_m in tl.range(0, L, BLOCK_M2):
@@ -221,7 +237,7 @@ def _attn_bwd_dkdv(
             dpT = tl.dot(v, tl.trans(do))
             dsT = pT * (dpT - delta[None, :])
             dk += tl.dot(dsT.to(q.dtype), q)
-        
+
         # Increment pointers
         Q_ptrs += BLOCK_M2 * D
         DOS_ptrs += BLOCK_M2 * D
@@ -235,11 +251,82 @@ def _attn_bwd_dkdv(
     tl.store(DV_ptrs, dv, mask=offs_n[:, None] < L)
     
 
+# Optional aiter CK-tile VSA path. `aiter.ops.sla` provides drop-in
+# CK sparse-attention fwd and bwd implementations for BLKQ ∈ {64, 128},
+# BLKK == 64, D == 128, bf16. When unavailable (aiter not installed or
+# the SLA ops module missing), the gates below return False and the
+# dispatch falls through to the Triton path.
+try:
+    from aiter.ops.sla import sla_fwd as _aiter_sla_fwd
+    _CK_SLA_FWD_AVAILABLE = True
+except Exception:
+    _aiter_sla_fwd = None
+    _CK_SLA_FWD_AVAILABLE = False
+
+try:
+    from aiter.ops.sla import sla_bwd as _aiter_sla_bwd
+    _CK_SLA_BWD_AVAILABLE = True
+except Exception:
+    _aiter_sla_bwd = None
+    _CK_SLA_BWD_AVAILABLE = False
+
+_CK_SLA_AVAILABLE = _CK_SLA_FWD_AVAILABLE
+
+
+def _sla_use_ck_fwd(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool:
+    """Return True if the CK forward path is available for this shape.
+
+    The CK fwd supports BLOCK_M ∈ {64, 128}, BLOCK_N == 64, D == 128, bf16.
+    Disabled when SLA_DISABLE_CK=1.
+    """
+    import os
+    if os.environ.get("SLA_DISABLE_CK", "0") == "1":
+        return False
+    return (
+        _CK_SLA_FWD_AVAILABLE
+        and q.dtype == torch.bfloat16
+        and D == 128
+        and BLOCK_M in (64, 128)
+        and BLOCK_N == 64
+        and q.is_contiguous()
+    )
+
+
+_sla_use_ck = _sla_use_ck_fwd  # legacy alias
+
+
+def _sla_use_ck_bwd(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool:
+    """Return True if the CK backward path is available for this shape.
+
+    The CK bwd is a split dkdv + dq pipeline at kM0 = 64. Both BLOCK_M = 64
+    (q_scale = 1) and BLOCK_M = 128 (q_scale = 2) dispatch to the same
+    instantiation. It consumes log2-space LSE, so it is compatible with
+    either the CK fwd or the Triton fwd.
+
+    Default is ON. Disable via SLA_USE_CK_BWD=0 or SLA_DISABLE_CK=1.
+    """
+    import os
+    if os.environ.get("SLA_USE_CK_BWD", "1") != "1":
+        return False
+    if os.environ.get("SLA_DISABLE_CK", "0") == "1":
+        return False
+    return (
+        _CK_SLA_BWD_AVAILABLE
+        and q.dtype == torch.bfloat16
+        and D == 128
+        and BLOCK_M in (64, 128)
+        and BLOCK_N == 64
+        and q.is_contiguous()
+    )
+
+
 class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-        assert k_block_id.is_contiguous() and lut.is_contiguous()
+        # k_block_id may be None for inference (skip in get_block_map under no-grad)
+        assert k_block_id is None or k_block_id.is_contiguous()
+        assert lut.is_contiguous()
 
         # We recommend the following two settings
         assert BLOCK_M == 64 or BLOCK_M == 128
@@ -251,6 +338,30 @@ class _attention(torch.autograd.Function):
 
         M_BLOCKS = triton.cdiv(L, BLOCK_M)
 
+        # CK dispatch. fwd and bwd gates are independent; both fwds store
+        # log2-space LSE so the CK bwd can consume either fwd's output.
+        needs_grad = any(t.requires_grad for t in (q, k, v))
+        ck_fwd_ok = _sla_use_ck_fwd(q, D, BLOCK_M, BLOCK_N)
+        ck_bwd_ok = _sla_use_ck_bwd(q, D, BLOCK_M, BLOCK_N)
+
+        # Full CK path. Only taken when grad is not needed, or the CK bwd
+        # is also compatible — otherwise saving k_block_id for the Triton
+        # bwd would require extra state that CK fwd doesn't produce.
+        if ck_fwd_ok and (not needs_grad or ck_bwd_ok):
+            lut_bhq = lut.view(B, H, M_BLOCKS, topk).to(torch.int32).contiguous()
+            o_s, lse_ck = _aiter_sla_fwd(
+                q, k, v, lut_bhq, BLOCK_M, BLOCK_N, float(qk_scale)
+            )
+            if needs_grad:
+                ctx.save_for_backward(q, k, v, lut_bhq, lse_ck, o_s)
+                ctx.ck_bwd_path = True
+            ctx.qk_scale = qk_scale
+            ctx.topk = topk
+            ctx.BLOCK_M = BLOCK_M
+            ctx.BLOCK_N = BLOCK_N
+            return o_s
+
+        # Triton fwd fallback (CK fwd not available, or CK bwd disabled).
         o_s = torch.empty_like(v)
         lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
 
@@ -263,8 +374,17 @@ class _attention(torch.autograd.Function):
             L, M_BLOCKS,
             D, BLOCK_M, BLOCK_N,
         )
-        
-        ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
+
+        if needs_grad:
+            if ck_bwd_ok:
+                # Triton fwd + CK bwd cross-path: Triton stores log2-space
+                # LSE which the CK bwd consumes directly.
+                lut_bhq = lut.view(B, H, M_BLOCKS, topk).to(torch.int32).contiguous()
+                ctx.save_for_backward(q, k, v, lut_bhq, lse, o_s)
+                ctx.ck_bwd_path = True
+            else:
+                ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
+                ctx.ck_bwd_path = False
         ctx.qk_scale = qk_scale
         ctx.topk = topk
         ctx.BLOCK_M = BLOCK_M
@@ -273,10 +393,24 @@ class _attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do_s):
+        BLOCK_M, BLOCK_N = ctx.BLOCK_M, ctx.BLOCK_N
+
+        # CK bwd path: saved_tensors is (q, k, v, lut_bhq, lse, o_s) with
+        # lse in log2 space. sla_bwd builds its transposed K-major LUT
+        # internally. k_block_id / lut grads are None since forward took
+        # the k_block_id-less branch.
+        if getattr(ctx, "ck_bwd_path", False):
+            q, k, v, lut_bhq, lse_ck, o_s = ctx.saved_tensors
+            do_s = do_s.contiguous()
+            dq, dk, dv = _aiter_sla_bwd(
+                do_s, q, k, v, o_s, lse_ck, lut_bhq,
+                BLOCK_M, BLOCK_N, float(ctx.qk_scale),
+            )
+            return dq, dk, dv, None, None, None, None, None, None
+
         q, k, v, k_block_id, lut, lse, o_s = ctx.saved_tensors
         do_s = do_s.contiguous()
 
-        BLOCK_M, BLOCK_N = ctx.BLOCK_M, ctx.BLOCK_N
         B, H, L, D = q.shape
 
         M_BLOCKS = triton.cdiv(L, BLOCK_M)
