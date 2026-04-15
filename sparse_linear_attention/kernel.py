@@ -273,11 +273,12 @@ _CK_SLA_AVAILABLE = _CK_SLA_FWD_AVAILABLE
 def _sla_use_ck_fwd(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool:
     """Gate the CK fwd path.
 
-    The CK VSA fwd pipeline is only instantiated at (kM0=128, kN0=64)
-    today, so Config C is the only SLA tile shape it accepts. Extending
-    to BLKQ=64 (Config A/B) requires adding a (kM0=64, kN0=64) tile
-    instance to the fwd codegen — see REPRODUCE.md "Supported
-    configurations" for the engineering notes.
+    Option 2 added a (kM0=64, kN0=64) tile instance to the fwd codegen,
+    so BLKQ=64 (Config A/B) now dispatches through the CK fwd as well.
+    BLKQ=128 (Config C) continues to use the kM0=128 tile. Runtime
+    dispatch between the two instances is driven by `args.block_m`
+    inside the generated `fmha_vsa_fwd` entry point (seqtune property
+    in codegen/ops/fmha_fwd_vsa.py).
     """
     import os
     if os.environ.get("SLA_DISABLE_CK", "0") == "1":
@@ -286,7 +287,7 @@ def _sla_use_ck_fwd(q: torch.Tensor, D: int, BLOCK_M: int, BLOCK_N: int) -> bool
         _CK_SLA_FWD_AVAILABLE
         and q.dtype == torch.bfloat16
         and D == 128
-        and BLOCK_M == 128
+        and BLOCK_M in (64, 128)
         and BLOCK_N == 64
         and q.is_contiguous()
     )
