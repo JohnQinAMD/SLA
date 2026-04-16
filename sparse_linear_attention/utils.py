@@ -40,6 +40,17 @@ def compress_kernel(
     tl.store(XM + xm_offset + idx_l * D + offs_d, x_mean.to(XM.dtype.element_ty))
 
 
+@torch.compile(dynamic=False, mode="max-autotune-no-cudagraphs")
+def _smooth_k(k):
+    """Smooth-K (SageAttention): subtract per-(B,H) mean from K.
+
+    Wrapped in torch.compile so inductor can fuse the mean reduction with
+    the subtract into one (or two) kernel(s) without a large intermediate
+    that the eager `k - torch.mean(k, dim=-2, keepdim=True)` allocates.
+    """
+    return k - torch.mean(k, dim=-2, keepdim=True)
+
+
 def mean_pool(x, BLK):
     assert x.is_contiguous()
 
@@ -53,7 +64,16 @@ def mean_pool(x, BLK):
 
 
 def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
-    arg_k = k - torch.mean(k, dim=-2, keepdim=True) # smooth-k technique in SageAttention
+    # smooth-k technique in SageAttention: subtract per-(B,H) mean from k
+    # before pooling. Wrapped in torch.compile to avoid a large intermediate.
+    # Set SLA_SKIP_SMOOTH_K=1 to bypass smooth-k
+    # (saves preprocessing time at the cost of attention selection quality —
+    # validate downstream before enabling in production).
+    import os as _os
+    if _os.environ.get("SLA_SKIP_SMOOTH_K", "0") == "1":
+        arg_k = k
+    else:
+        arg_k = _smooth_k(k)
     pooled_qblocks = mean_pool(q, BLKQ)
     pooled_kblocks = mean_pool(arg_k, BLKK)
     pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2)
@@ -62,6 +82,11 @@ def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
     topk = min(K, int(topk_ratio * K))
     lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
 
-    sparse_map = torch.zeros_like(pooled_score, dtype=torch.int8)
-    sparse_map.scatter_(-1, lut, 1)
+    # `sparse_map` (`k_block_id`) is only consumed by the backward pass.
+    # Skip the zeros_like + scatter_ when grad is not needed (inference).
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad):
+        sparse_map = torch.zeros_like(pooled_score, dtype=torch.int8)
+        sparse_map.scatter_(-1, lut, 1)
+    else:
+        sparse_map = None
     return sparse_map, lut, topk
