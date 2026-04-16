@@ -88,11 +88,14 @@ def get_triton_autotune_decorator(func : Callable, L : int, D : int, phase: Phas
         return _tuned_kernel_caches[tuned_key]
 
     def get_autotune_configs():
+        # num_stages=0 fails to compile on gfx950 (PassManager::run failed);
+        # num_warps=8 + matrix_instr_nonkdim=16 is what the curated sweep picks
+        # as optimal for all three SLA kernels on gfx950.
         configs = []
-        for num_warps in [2, 4]:
-            for num_stages in ([0, 1] if phase == Phase.FORWARD else [0, 1, 2, 3]):
+        for num_warps in [2, 4, 8]:
+            for num_stages in ([1, 2] if phase == Phase.FORWARD else [1, 2, 3]):
                 for waves_per_eu in [2]:
-                    for matrix_instr_nonkdim in ([32] if phase == Phase.FORWARD else [16, 32]):
+                    for matrix_instr_nonkdim in [16, 32]:
                         for kpack in ([1] if GPU_ARCH == "gfx950" else [1, 2]):
                             configs.append(triton.Config(
                                 {"waves_per_eu" : waves_per_eu, "matrix_instr_nonkdim" : matrix_instr_nonkdim, "kpack" : kpack},
@@ -102,7 +105,7 @@ def get_triton_autotune_decorator(func : Callable, L : int, D : int, phase: Phas
     tuning_configs = get_autotune_configs()
     tuned_kernel = triton.autotune(
         configs = tuning_configs,
-        key = ["L", "D"],
+        key = ["L", "D", "BLOCK_M", "BLOCK_N"],
         warmup = 3,
         rep = 10,
         )(func)
